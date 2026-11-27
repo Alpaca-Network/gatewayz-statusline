@@ -18,11 +18,23 @@ It needs nothing beyond Python 3.9+ (standard library only). Network calls are c
 
 ## Install
 
+**As a Claude Code plugin** (recommended):
+
+```
+/plugin install gatewayz-statusline --marketplace Alpaca-Network/gatewayz-statusline
+```
+
+Then run `/gatewayz-statusline:setup`. Plugins can't set the status line themselves, so this skill does it for you. It copies the script to `~/.gatewayz/bin/` and shows the `statusLine` entry it wants to add to `~/.claude/settings.json`. Nothing changes until you approve.
+
+On Claude Code before 2.1.275, run `/plugin marketplace add Alpaca-Network/gatewayz-statusline` first, then `/plugin install gatewayz-statusline@gatewayz`.
+
+**By hand:**
+
 ```bash
 git clone https://github.com/Alpaca-Network/gatewayz-statusline ~/.gatewayz/gatewayz-statusline
 ```
 
-Add to `~/.claude/settings.json`, or pass it to a single session with `claude --settings '…'`:
+Then add this to `~/.claude/settings.json`, or pass it to a single session with `claude --settings '…'`:
 
 ```json
 {
@@ -60,7 +72,6 @@ The tests run against a local fake API. They make no network calls and need no k
 
 ## Roadmap
 
-- Package as a Claude Code plugin.
 - Same tracker for OpenCode and other harnesses.
 - Count sub-agent transcripts in the token total.
 

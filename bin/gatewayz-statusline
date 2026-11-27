@@ -58,7 +58,9 @@ def human(n: float) -> str:
 
 
 def money(x: float) -> str:
-    return f"${x:,.2f}" if abs(x) >= 0.01 or x == 0 else f"${x:.4f}"
+    if 0 < x < 0.01:
+        return "<$0.01"
+    return f"${x:,.2f}"
 
 
 def load_json(path: str):

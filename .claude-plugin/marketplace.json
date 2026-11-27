@@ -1,0 +1,14 @@
+{
+  "name": "gatewayz",
+  "description": "Gatewayz plugins for Claude Code",
+  "owner": {
+    "name": "Alpaca Network"
+  },
+  "plugins": [
+    {
+      "name": "gatewayz-statusline",
+      "source": "./",
+      "description": "Live tokens and real Gatewayz spend per session in the Claude Code status line"
+    }
+  ]
+}

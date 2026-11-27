@@ -1,0 +1,10 @@
+{
+  "name": "gatewayz-statusline",
+  "version": "0.2.0",
+  "description": "Live tokens and real Gatewayz spend per session in the Claude Code status line",
+  "author": { "name": "Alpaca Network" },
+  "homepage": "https://github.com/Alpaca-Network/gatewayz-statusline",
+  "repository": "https://github.com/Alpaca-Network/gatewayz-statusline",
+  "license": "MIT",
+  "keywords": ["gatewayz", "statusline", "tokens", "cost"]
+}

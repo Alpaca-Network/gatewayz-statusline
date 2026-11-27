@@ -121,6 +121,11 @@ class StatuslineTest(unittest.TestCase):
         self.assertNotIn("~", line)
         self.assertTrue(any(p.startswith("/v1/usage?tag=cc-abc") for p in FakeAPI.calls))
 
+    def test_sub_cent_spend(self):
+        FakeAPI.usage_rows = [{"tag": "cc-abc", "cost_usd": 0.000034}]
+        line = self.run_line({"ANTHROPIC_CUSTOM_HEADERS": "x-gatewayz-tag: cc-abc"})
+        self.assertIn("<$0.01 this session", line)
+
     def test_incremental_reads_pick_up_new_lines(self):
         self.run_line()
         with open(self.transcript, "a") as f:
