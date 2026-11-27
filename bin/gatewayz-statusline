@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Gatewayz token + spend tracker for the Claude Code status line.
+
+    Gatewayz · kimi-k2.6 · ↑182k ↓9.4k tok · $0.43 this session · $12.30 left
+
+Claude Code runs this command after each turn and passes session details as
+JSON on stdin (session_id, transcript_path, model, ...). This script:
+
+* sums tokens from the session transcript (incrementally, so long sessions
+  stay fast), de-duplicating streamed copies of the same message;
+* gets the real Gatewayz spend for the session:
+    - exact, when the session sends an `x-gatewayz-tag` header (set through
+      ANTHROPIC_CUSTOM_HEADERS): GET /v1/usage?tag=<tag>;
+    - otherwise an estimate: credits at session start minus credits now
+      (shown with "~", since other sessions on the same key also spend);
+* shows credits left from GET /user/balance.
+
+Claude Code's own `cost.total_cost_usd` uses Anthropic list prices, which are
+wrong for every non-Claude model on Gatewayz, so it is never shown.
+
+Network calls are cached for CACHE_SECONDS and time out fast; any failure just
+drops that part of the line. The API key is read from the environment
+(ANTHROPIC_AUTH_TOKEN or GATEWAYZ_API_KEY), never printed and never written to
+disk. Standard library only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+CACHE_SECONDS = int(os.environ.get("GATEWAYZ_STATUSLINE_CACHE_SECONDS", "30"))
+TIMEOUT = 3
+STATE_DIR = os.path.expanduser(os.environ.get("GATEWAYZ_STATUSLINE_DIR", "~/.gatewayz/statusline"))
+DEFAULT_BASE = "https://api.gatewayz.ai"
+TAG_HEADERS = ("x-gatewayz-tag", "x-tag")
+TAG_RE = re.compile(r"^[A-Za-z0-9._:/@=-]{1,128}$")  # same rule as the gateway
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+MAX_SEEN_IDS = 20000
+
+
+# --- small helpers -----------------------------------------------------------
+
+def human(n: float) -> str:
+    n = float(n)
+    for unit, size in (("M", 1e6), ("k", 1e3)):
+        if abs(n) >= size:
+            value = n / size
+            return f"{value:.1f}{unit}" if value < 100 else f"{value:.0f}{unit}"
+    return str(int(n))
+
+
+def money(x: float) -> str:
+    return f"${x:,.2f}" if abs(x) >= 0.01 or x == 0 else f"${x:.4f}"
+
+
+def load_json(path: str):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_json(path: str, data) -> None:
+    """Atomic write into the private state folder; failures are ignored."""
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def api_key() -> str | None:
+    return os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("GATEWAYZ_API_KEY") or None
+
+
+def base_url() -> str:
+    return (os.environ.get("GATEWAYZ_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL") or DEFAULT_BASE).rstrip("/")
+
+
+def key_id(key: str) -> str:
+    """Cache namespace per key, without storing the key."""
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def session_tag() -> str | None:
+    """The x-gatewayz-tag this session sends, from ANTHROPIC_CUSTOM_HEADERS."""
+    raw = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+    for line in re.split(r"[\n\r]+", raw):
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() in TAG_HEADERS:
+            value = value.strip()
+            return value if TAG_RE.match(value) else None
+    return None
+
+
+def get(path: str, key: str):
+    request = urllib.request.Request(
+        base_url() + path,
+        headers={"Authorization": f"Bearer {key}", "User-Agent": "gatewayz-statusline"},
+    )
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        return json.load(response)
+
+
+def cached(name: str, key: str, fetch):
+    """fetch() result cached per key for CACHE_SECONDS; None on failure."""
+    path = os.path.join(STATE_DIR, f"cache-{key_id(key)}-{name}.json")
+    entry = load_json(path)
+    if isinstance(entry, dict) and time.time() - entry.get("at", 0) < CACHE_SECONDS:
+        return entry.get("value")
+    try:
+        value = fetch()
+    except Exception:
+        return None
+    save_json(path, {"at": time.time(), "value": value})
+    return value
+
+
+# --- tokens from the transcript ---------------------------------------------
+
+def transcript_tokens(session_id: str, transcript_path: str) -> dict | None:
+    """Token totals for the session, read incrementally from the JSONL transcript."""
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return None
+    state_path = os.path.join(STATE_DIR, f"tokens-{session_id}.json")
+    state = load_json(state_path) or {}
+    size = os.path.getsize(transcript_path)
+    if state.get("path") != transcript_path or state.get("offset", 0) > size:
+        state = {}  # new transcript, or it was rewritten: start over
+    totals = state.get("totals") or {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "turns": 0}
+    seen = state.get("seen") or []
+    seen_set = set(seen)
+    offset = state.get("offset", 0)
+
+    with open(transcript_path, "rb") as f:
+        f.seek(offset)
+        for raw in f:
+            if not raw.endswith(b"\n"):
+                break  # partial last line: read it next time
+            offset += len(raw)
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict) or entry.get("type") != "assistant":
+                continue
+            message = entry.get("message")
+            if not isinstance(message, dict) or not isinstance(message.get("usage"), dict):
+                continue
+            # One API response is written as several lines (one per content
+            # block), each repeating the same usage: count it once.
+            mid = message.get("id") or entry.get("requestId") or entry.get("uuid")
+            if mid in seen_set:
+                continue
+            seen_set.add(mid)
+            seen.append(mid)
+            usage = message["usage"]
+            totals["input"] += int(usage.get("input_tokens") or 0)
+            totals["output"] += int(usage.get("output_tokens") or 0)
+            totals["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
+            totals["cache_write"] += int(usage.get("cache_creation_input_tokens") or 0)
+            totals["turns"] += 1
+
+    save_json(state_path, {"path": transcript_path, "offset": offset, "totals": totals,
+                           "seen": seen[-MAX_SEEN_IDS:]})
+    return totals
+
+
+# --- spend -------------------------------------------------------------------
+
+def tagged_spend(key: str, tag: str) -> float | None:
+    def fetch():
+        body = get("/v1/usage?" + urllib.parse.urlencode({"tag": tag}), key)
+        return sum(float(row.get("cost_usd") or 0) for row in body.get("data") or [] if row.get("tag") == tag)
+    return cached("usage-" + hashlib.sha256(tag.encode()).hexdigest()[:12], key, fetch)
+
+
+def credits_left(key: str) -> float | None:
+    return cached("balance", key, lambda: float(get("/user/balance", key)["credits"]))
+
+
+def estimated_spend(session_id: str, key: str, credits: float | None) -> float | None:
+    """Credits at session start minus credits now (needs a balance at both ends)."""
+    if credits is None:
+        return None
+    path = os.path.join(STATE_DIR, f"start-{session_id}.json")
+    start = load_json(path)
+    if not isinstance(start, dict) or start.get("key") != key_id(key):
+        save_json(path, {"key": key_id(key), "credits": credits, "at": time.time()})
+        return 0.0
+    spent = float(start["credits"]) - credits
+    if spent < 0:  # credits were added mid-session: restart the baseline
+        save_json(path, {"key": key_id(key), "credits": credits, "at": time.time()})
+        return 0.0
+    return spent
+
+
+# --- the line ----------------------------------------------------------------
+
+def model_name(session: dict) -> str:
+    model = session.get("model")
+    name = (model.get("display_name") or model.get("id") or "") if isinstance(model, dict) else str(model or "")
+    name = name or os.environ.get("ANTHROPIC_MODEL", "")
+    return name.removeprefix("claude-code/")
+
+
+def build_line(session: dict) -> str:
+    parts = ["Gatewayz"]
+    name = model_name(session)
+    if name:
+        parts.append(name)
+
+    session_id = str(session.get("session_id") or "")
+    if not SESSION_RE.match(session_id):
+        session_id = ""
+
+    if session_id:
+        try:
+            tokens = transcript_tokens(session_id, str(session.get("transcript_path") or ""))
+        except OSError:
+            tokens = None
+        if tokens and tokens["turns"]:
+            sent = tokens["input"] + tokens["cache_read"] + tokens["cache_write"]
+            parts.append(f"↑{human(sent)} ↓{human(tokens['output'])} tok")
+
+    key = api_key()
+    if key:
+        credits = credits_left(key)
+        tag = session_tag()
+        spend = tagged_spend(key, tag) if tag else None
+        if spend is not None:
+            parts.append(f"{money(spend)} this session")
+        elif session_id:
+            estimate = estimated_spend(session_id, key, credits)
+            if estimate is not None:
+                parts.append(f"~{money(estimate)} this session")
+        if credits is not None:
+            parts.append(f"{money(credits)} left")
+
+    return " · ".join(parts)
+
+
+def main() -> None:
+    try:
+        session = json.load(sys.stdin)
+    except ValueError:
+        session = {}
+    if not isinstance(session, dict):
+        session = {}
+    try:
+        print(build_line(session))
+    except Exception:  # a status line must never crash the UI
+        print("Gatewayz")
+
+
+if __name__ == "__main__":
+    main()
