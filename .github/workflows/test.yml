@@ -3,14 +3,17 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  test:
+  linux:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.9", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.13"
       - run: python -m unittest discover -v tests
+  macos-system-python:
+    # The Python that ships with macOS (3.9), which most users run this with.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: /usr/bin/python3 --version && /usr/bin/python3 -m unittest discover -v tests
